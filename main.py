@@ -1,263 +1,337 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import requests
-import threading
-import queue
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-TEST_URL = "https://api.ipify.org?format=json"
-TIMEOUT = 8
-MAX_WORKERS = 10
+# =========================
+# CONFIGURATION
+# =========================
 
-results_queue = queue.Queue()
+BG = "#111318"
+PANEL = "#1b1e25"
+ACCENT = "#38bdf8"
+TEXT = "#ffffff"
+MUTED = "#999999"
+
 results = []
-running = False
+proxies = []
 
 
-def parse_proxies(text):
-    proxies = []
+# =========================
+# VALIDATION
+# =========================
+
+def validate_proxy(proxy):
+    proxy = proxy.strip()
+
+    match = re.fullmatch(
+        r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})",
+        proxy
+    )
+
+    if not match:
+        return False
+
+    ip = match.group(1)
+    port = int(match.group(2))
+
+    if not all(0 <= int(part) <= 255 for part in ip.split(".")):
+        return False
+
+    if not 1 <= port <= 65535:
+        return False
+
+    return True
+
+
+def parse_list(text):
+    valid = []
+    invalid = []
+    seen = set()
+
     for line in text.splitlines():
         line = line.strip()
-        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}", line):
-            ip, port = line.split(":")
-            if all(0 <= int(x) <= 255 for x in ip.split(".")) and 1 <= int(port) <= 65535:
-                if line not in proxies:
-                    proxies.append(line)
-    return proxies
+
+        if not line:
+            continue
+
+        if line in seen:
+            continue
+
+        seen.add(line)
+
+        if validate_proxy(line):
+            valid.append(line)
+        else:
+            invalid.append(line)
+
+    return valid, invalid
 
 
-def check_proxy(proxy):
-    start = time.time()
-    config = {
-        "http": f"http://{proxy}",
-        "https": f"http://{proxy}"
-    }
+# =========================
+# IMPORT
+# =========================
+
+def import_file():
+    path = filedialog.askopenfilename(
+        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+    )
+
+    if not path:
+        return
 
     try:
-        response = requests.get(
-            TEST_URL,
-            proxies=config,
-            timeout=TIMEOUT
-        )
+        with open(path, "r", encoding="utf-8") as file:
+            content = file.read()
 
-        if response.status_code == 200:
-            latency = round((time.time() - start) * 1000)
-            return proxy, "LIVE", latency
+        input_area.delete("1.0", tk.END)
+        input_area.insert(tk.END, content)
 
-        return proxy, "DEAD", 0
+        refresh_list()
 
-    except requests.exceptions.Timeout:
-        return proxy, "TIMEOUT", 0
-    except requests.exceptions.RequestException:
-        return proxy, "DEAD", 0
+    except Exception as e:
+        messagebox.showerror("Erreur", str(e))
 
 
-def start_check():
-    global running, results
+# =========================
+# REFRESH
+# =========================
 
-    if running:
-        return
+def refresh_list():
+    global proxies, results
 
-    proxies = parse_proxies(input_area.get("1.0", tk.END))
-
-    if not proxies:
-        messagebox.showwarning("Attention", "Aucun proxy valide trouvé.")
-        return
+    proxies, invalid = parse_list(
+        input_area.get("1.0", tk.END)
+    )
 
     results = []
-    running = True
 
     for item in tree.get_children():
         tree.delete(item)
 
-    progress["maximum"] = len(proxies)
-    progress["value"] = 0
+    total = len(proxies) + len(invalid)
 
-    status_label.config(text=f"Test de {len(proxies)} proxies...")
-    start_button.config(state="disabled")
+    progress["maximum"] = max(total, 1)
+    progress["value"] = total
 
-    threading.Thread(
-        target=run_tests,
-        args=(proxies,),
-        daemon=True
-    ).start()
+    for proxy in proxies:
+        tree.insert(
+            "",
+            tk.END,
+            values=(proxy, "FORMAT OK", "—"),
+            tags=("valid",)
+        )
 
-    root.after(100, process_queue)
+    for proxy in invalid:
+        tree.insert(
+            "",
+            tk.END,
+            values=(proxy, "INVALID", "—"),
+            tags=("invalid",)
+        )
 
+    counter_label.config(
+        text=f"{total} entrées | {len(proxies)} valides | {len(invalid)} invalides"
+    )
 
-def run_tests(proxies):
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(check_proxy, proxy)
-            for proxy in proxies
-        ]
-
-        for future in as_completed(futures):
-            results_queue.put(future.result())
-
-    results_queue.put(None)
-
-
-def process_queue():
-    global running
-
-    try:
-        while True:
-            item = results_queue.get_nowait()
-
-            if item is None:
-                running = False
-                start_button.config(state="normal")
-                live = sum(1 for r in results if r[1] == "LIVE")
-                status_label.config(
-                    text=f"Terminé ! {live} proxies fonctionnels sur {len(results)}."
-                )
-                return
-
-            proxy, status, latency = item
-            results.append(item)
-
-            tree.insert(
-                "",
-                tk.END,
-                values=(
-                    proxy,
-                    status,
-                    f"{latency} ms" if status == "LIVE" else "-"
-                )
-            )
-
-            progress["value"] += 1
-            live = sum(1 for r in results if r[1] == "LIVE")
-            counter_label.config(
-                text=f"{len(results)} / {int(progress['maximum'])} | LIVE : {live}"
-            )
-
-    except queue.Empty:
-        pass
-
-    if running:
-        root.after(100, process_queue)
+    status_label.config(
+        text="Liste analysée"
+    )
 
 
-def export_results():
-    live_proxies = [
-        proxy for proxy, status, latency in results
-        if status == "LIVE"
-    ]
+# =========================
+# EXPORT
+# =========================
 
-    if not live_proxies:
-        messagebox.showinfo("Export", "Aucun proxy fonctionnel à exporter.")
+def export_valid():
+    valid, invalid = parse_list(
+        input_area.get("1.0", tk.END)
+    )
+
+    if not valid:
+        messagebox.showinfo(
+            "Export",
+            "Aucune entrée valide à exporter."
+        )
         return
 
     path = filedialog.asksaveasfilename(
         defaultextension=".txt",
-        filetypes=[("Fichier TXT", "*.txt")],
-        initialfile="working_proxies.txt"
+        filetypes=[("Text files", "*.txt")],
+        initialfile="valid_proxies.txt"
     )
 
-    if path:
+    if not path:
+        return
+
+    try:
         with open(path, "w", encoding="utf-8") as file:
-            file.write("\n".join(live_proxies))
+            file.write("\n".join(valid))
 
-        messagebox.showinfo("Export", "Export terminé !")
+        messagebox.showinfo(
+            "Export",
+            f"{len(valid)} entrées exportées."
+        )
+
+    except Exception as e:
+        messagebox.showerror("Erreur", str(e))
 
 
-# INTERFACE
+def clear_all():
+    input_area.delete("1.0", tk.END)
+    refresh_list()
+
+
+# =========================
+# GUI
+# =========================
 
 root = tk.Tk()
 root.title("Proxy Checker")
 root.geometry("850x650")
 root.minsize(700, 550)
-root.configure(bg="#111318")
+root.configure(bg=BG)
 
 style = ttk.Style()
 style.theme_use("clam")
+
 style.configure(
     "Treeview",
-    background="#1b1e25",
-    foreground="white",
-    fieldbackground="#1b1e25",
-    rowheight=27
+    background=PANEL,
+    foreground=TEXT,
+    fieldbackground=PANEL,
+    rowheight=29,
+    borderwidth=0
 )
+
 style.configure(
     "Treeview.Heading",
     background="#252a34",
-    foreground="white"
+    foreground=TEXT,
+    font=("Arial", 10, "bold")
 )
+
+style.map(
+    "Treeview",
+    background=[("selected", "#263e55")],
+    foreground=[("selected", "white")]
+)
+
 style.configure(
     "Horizontal.TProgressbar",
     troughcolor="#252a34",
-    background="#38bdf8"
+    background=ACCENT
 )
 
-title = tk.Label(
-    root,
-    text="PROXY CHECKER",
-    font=("Arial", 23, "bold"),
-    fg="#38bdf8",
-    bg="#111318"
-)
-title.pack(pady=(20, 5))
 
-subtitle = tk.Label(
-    root,
-    text="HTTP Proxy Connectivity Tester",
-    font=("Arial", 10),
-    fg="#999999",
-    bg="#111318"
-)
-subtitle.pack(pady=(0, 15))
+# TITLE
 
 tk.Label(
     root,
-    text="Liste des proxies (IP:PORT)",
-    fg="white",
-    bg="#111318",
+    text="PROXY CHECKER",
+    font=("Arial", 24, "bold"),
+    fg=ACCENT,
+    bg=BG
+).pack(pady=(20, 4))
+
+tk.Label(
+    root,
+    text="Proxy list manager & validator",
+    font=("Arial", 10),
+    fg=MUTED,
+    bg=BG
+).pack(pady=(0, 18))
+
+
+# INPUT
+
+tk.Label(
+    root,
+    text="Proxy list (IP:PORT)",
+    fg=TEXT,
+    bg=BG,
     font=("Arial", 11, "bold")
 ).pack(anchor="w", padx=25)
 
 input_area = tk.Text(
     root,
     height=8,
-    bg="#1b1e25",
-    fg="white",
-    insertbackground="white",
+    bg=PANEL,
+    fg=TEXT,
+    insertbackground=TEXT,
     font=("Consolas", 10),
-    relief="flat"
-)
-input_area.pack(fill="x", padx=25, pady=10)
-
-start_button = tk.Button(
-    root,
-    text="▶  LANCER LES TESTS",
-    command=start_check,
-    bg="#2563eb",
-    fg="white",
-    activebackground="#1d4ed8",
     relief="flat",
-    font=("Arial", 11, "bold"),
+    padx=10,
+    pady=8
+)
+
+input_area.pack(
+    fill="x",
+    padx=25,
     pady=10
 )
-start_button.pack(fill="x", padx=25, pady=5)
+
+
+# BUTTONS
+
+button_frame = tk.Frame(root, bg=BG)
+button_frame.pack(fill="x", padx=25)
+
+tk.Button(
+    button_frame,
+    text="📂 IMPORT TXT",
+    command=import_file,
+    bg="#252a34",
+    fg=TEXT,
+    relief="flat",
+    pady=9
+).pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+tk.Button(
+    button_frame,
+    text="🔎 ANALYSER",
+    command=refresh_list,
+    bg="#2563eb",
+    fg="white",
+    relief="flat",
+    pady=9
+).pack(side="left", expand=True, fill="x", padx=5)
+
+tk.Button(
+    button_frame,
+    text="🗑 EFFACER",
+    command=clear_all,
+    bg="#252a34",
+    fg=TEXT,
+    relief="flat",
+    pady=9
+).pack(side="left", expand=True, fill="x", padx=(5, 0))
+
+
+# PROGRESS
 
 progress = ttk.Progressbar(
     root,
     mode="determinate",
     style="Horizontal.TProgressbar"
 )
-progress.pack(fill="x", padx=25, pady=10)
+
+progress.pack(fill="x", padx=25, pady=15)
+
+
+# COUNTERS
 
 counter_label = tk.Label(
     root,
-    text="0 / 0 | LIVE : 0",
-    fg="#aaaaaa",
-    bg="#111318"
+    text="0 entrées",
+    fg=MUTED,
+    bg=BG
 )
+
 counter_label.pack()
+
+
+# TABLE
 
 columns = ("proxy", "status", "latency")
 
@@ -265,41 +339,59 @@ tree = ttk.Treeview(
     root,
     columns=columns,
     show="headings",
-    height=11
+    height=12
 )
 
 tree.heading("proxy", text="PROXY")
 tree.heading("status", text="STATUS")
-tree.heading("latency", text="LATENCY")
+tree.heading("latency", text="INFO")
 
-tree.column("proxy", width=350)
-tree.column("status", width=150, anchor="center")
-tree.column("latency", width=150, anchor="center")
+tree.column("proxy", width=400)
+tree.column("status", width=180, anchor="center")
+tree.column("latency", width=120, anchor="center")
 
-tree.pack(fill="both", expand=True, padx=25, pady=10)
+tree.tag_configure(
+    "valid",
+    foreground="#4ade80"
+)
 
-tree.tag_configure("LIVE", foreground="#4ade80")
-tree.tag_configure("DEAD", foreground="#f87171")
-tree.tag_configure("TIMEOUT", foreground="#facc15")
+tree.tag_configure(
+    "invalid",
+    foreground="#f87171"
+)
+
+tree.pack(
+    fill="both",
+    expand=True,
+    padx=25,
+    pady=10
+)
+
+
+# STATUS
 
 status_label = tk.Label(
     root,
     text="En attente...",
-    fg="#999999",
-    bg="#111318"
+    fg=MUTED,
+    bg=BG
 )
+
 status_label.pack(pady=5)
 
-export_button = tk.Button(
+
+# EXPORT
+
+tk.Button(
     root,
-    text="↓  EXPORTER LES PROXIES LIVE",
-    command=export_results,
+    text="↓  EXPORTER LES ENTRÉES VALIDES",
+    command=export_valid,
     bg="#252a34",
-    fg="white",
+    fg=TEXT,
     relief="flat",
     font=("Arial", 10, "bold"),
-    pady=9
-)
-export_button.pack(fill="x", padx=25, pady=(5, 20))
+    pady=10
+).pack(fill="x", padx=25, pady=(5, 20))
+
 
 root.mainloop()
